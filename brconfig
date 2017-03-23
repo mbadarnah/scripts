@@ -1,0 +1,1704 @@
+#!/bin/bash
+# Author:  Mohamad B. - Mohamadb@mellanox.com
+
+##
+# Usage
+##
+function usage(){
+	version
+        echo "Usage:
+		show 				Show Bridges Configured  
+                -m|--mode                       Configure mode
+                        [ovs] Open vSwitch 
+                        [lb] Linux Bridge 
+			[all] For Remove ONLY
+                -s|--setting                    Configure setting
+                        [d] dynamic - (Default)
+                        [s] static
+                        [r] remove
+		-t|--type 			Configure type 
+			[eth] Ethernet 
+			[ib] Infiniband
+			[all] eth, ib - (Default)
+		-b|--bridge			Bridge name 
+			Default Open vSwtich - $linux_bridge_name
+			Default Linux Bridge - $open_vswitch_name
+		-e|--extend			Configuration VxLAN | GRE (Ethernet Only)
+			[vxlan|gre] 
+				[interface 'devname'] 
+	                        [remote 'ipv4']
+        	                [virt_ip 'ipv4/mask_length']
+				[bridge_name 'brname']
+				[virt_name 'name'] - Default vxlan10
+				[key N] - Default 5
+				[port N] - Default 4789
+				[num_vxlans N] - Default 1
+		-l|--mlx_name			Mellanox module name (Ethernet Only)
+			[mlx4 & mlx5] - (Default)
+			[mlx4] 
+			[mlx5]
+                -o|--bridge_over_interfaces     Create bridge with more
+                                                than 1 interface
+                        [0] - (Default)
+                        [interfaces]
+		-i|--interface			Create bridge over specific interface 
+		-b|--broadcast			Broadcast IPv4
+			[%d.%d.%d.%d] 
+			[123.15.255.255] - (Default)
+		-k|--mask_length		Interface IPv4 mask
+			[%d] 
+			[16] - (Default)
+		-v|--version			Show tool Version 
+                -h|--help                       Show this help"
+        exit
+}
+
+function version(){
+
+		echo "$tool_name $tool_version"
+}
+
+##
+# Get Mellanox Interfaces
+# in < ""
+# out > 2 arrays of Mellanox Interfaces (mlx4_interfaces, mlx5_interfaces)
+##
+function get_mlnx_interfaces(){
+	mlx4_interfaces=""
+	mlx5_interfaces=""
+	eipoib_interfaces=""
+	ipoib_interfaces=""
+
+        for ethpath in /sys/class/net/*; do
+                if (grep 0x15b3 ${ethpath}/device/vendor > /dev/null 2>&1); then
+                        if [[ `ethtool -i ${ethpath##*/} | grep driver` == *mlx5* ]]; then
+                                mlx5_interfaces="$mlx5_interfaces ${ethpath##*/}"
+                        elif [[ `ethtool -i ${ethpath##*/} | grep driver` == *mlx4* ]]; then 
+                                mlx4_interfaces="$mlx4_interfaces ${ethpath##*/}"
+			elif [[ `ethtool -i ${ethpath##*/} | grep driver` == *eth_ipoib* ]]; then
+				eipoib_interfaces="$eipoib_interfaces ${ethpath##*/}"
+			else 
+				ipoib_interfaces="$ipoib_interfaces ${ethpath##*/}"
+                        fi
+                fi
+        done
+
+        if [[ $mlx5_interfaces == "" ]] && [[ $mlx4_interfaces == "" ]] && [[ $eipoib_interfaces == "" ]]; then
+                echo "Err'- MLX Modules Down | Missing [HCA|Driver]."
+                exit
+        fi
+}
+
+##
+# Get Linux Bridge 
+# in < ""
+# out > array of linux bridge 
+##
+function get_linux_bridges(){
+        bridges_name=""
+	without_bridge=$1
+	without_flag=0
+	if [[ $without_bridge != "" ]]; then 
+		without_flag=1
+	fi
+
+	ovs_bridges=""
+	if [[ $ovs_flag == 0 ]]; then 
+	        ovs_bridges=`ovs-vsctl list-br`
+	fi 
+
+	lb_bridges=""	
+	if [[ $lb_flag == 0 ]]; then
+		for int_path in /sys/class/net/*; do
+			 if (grep "DEVTYPE=bridge" ${int_path}/uevent > /dev/null 2>&1); then
+				if [[ $without_flag == 1 ]]; then 
+					if [[ ${int_path##*/} =~ $without_bridge ]]; then 
+						continue 
+					else 
+						lb_bridges="$lb_bridges ${int_path##*/}"
+					fi
+				else 
+					lb_bridges="$lb_bridges ${int_path##*/}"
+				fi
+			fi
+		done
+	fi
+
+        bridges_name="$ovs_bridges $lb_bridges"
+}
+
+##
+# Get Attached Bridge Interfaces 
+# in < ""
+# out > arrays of attached interfaces 
+##
+function get_attached_linux_bridges(){
+        bridge_name=$1
+	bridge_type=$2 
+
+	attached_linux_bridge_interfaces_general=""
+	attached_mellanox_interfaces=""
+	attached_veth_interfaces=""
+	attached_vxlan_interfaces=""
+	mellanox_interfaces=""
+	attached_all_interfaces=""
+	veth_interfaces=""
+	vxlan_interfaces=""
+	
+        for int_path in /sys/class/net/*; do
+		if (grep 0x15b3 ${int_path}/device/vendor > /dev/null 2>&1); then
+                        mellanox_interfaces="$mellanox_interfaces ${int_path##*/}"
+		elif (grep veth ${int_path}/uevent > /dev/null 2>&1); then
+			veth_interfaces="$veth_interfaces ${int_path##*/}"
+		elif (grep vxlan ${int_path}/uevent > /dev/null 2>&1); then
+			vxlan_interfaces="$vxlan_interfaces ${int_path##*/}"
+                fi
+        done
+
+	virtual_interfaces="$veth_interfaces $vxlan_interfaces"
+	v_and_interfaces="$virtual_interfaces $mellanox_interfaces"
+	
+	ttchd_interfaces="";
+        cmd="brctl show $bridge_name"
+	if [[ $bridge_type == "ovs" ]]; then 
+        	cmd="ovs-vsctl list-ports $bridge_name"
+		output=`ovs-vsctl show | grep -i "type:.*vxlan"`
+		if [[ $? == 0 ]]; then 
+			all_attached_interfaces=`ovs-vsctl list-ports $bridge_name`
+			
+			for ifs_2 in $all_attached_interfaces; do 
+				flag_no=1
+
+				for ifs in $v_and_interfaces; do
+					if [[ $ifs_2 == $ifs ]]; then 
+						flag_no=0
+					fi
+				done 
+	
+				if [[ $flag_no == 1 ]]; then 
+					attached_vxlan_interfaces="$attached_vxlan_interfaces $ifs_2" 
+				fi 
+			done 
+		fi
+	
+		ttchd_interfaces=`ovs-vsctl list-ports $bridge_name`
+	else 
+		ttchd_interfaces=`brctl showstp $bridge_name | grep '(' | cut -d '(' -f1`
+	fi
+
+	for mlnx_ifs in $mellanox_interfaces; do
+		for tached_ifs in $ttchd_interfaces; do 
+			if [[ $mlnx_ifs == $tached_ifs ]]; then
+				attached_all_interfaces="$attached_all_interfaces $tached_ifs"
+				attached_mellanox_interfaces="$attached_mellanox_interfaces $tached_ifs"
+			fi
+		done 
+	done 
+
+	for virtual_ifs in $veth_interfaces; do 
+		for tached_ifs in $ttchd_interfaces; do
+			if [[ $virtual_ifs == $tached_ifs ]]; then
+				attached_all_interfaces="$attached_all_interfaces $tached_ifs"
+				attached_veth_interfaces="$attached_veth_interfaces $tached_ifs"
+			fi 
+		done 
+	done
+
+	for vxlan_ifs in $vxlan_interfaces; do
+		for tached_ifs in $ttchd_interfaces; do
+			if [[ $vxlan_ifs == $tached_ifs ]]; then
+				attached_all_interfaces="$attached_all_interfaces $tached_ifs"
+				attached_vxlan_interfaces="$attached_vxlan_interfaces $tached_ifs"
+			fi
+		done 
+	done
+}
+
+##
+# Create Static Configure
+# in <  1- interfaces
+#       2- bridge type (ovs/lb)
+#       3- ipv4/mask length
+#       4- bridge over interfaces (1 == yes)
+#       5- bridge id
+# out >
+##
+function create_static_bridge(){
+        interfaces=$1
+        bridge_type=$2
+        ip=$3
+        bridge_over_interfaces=$4
+        bridge_id=$5
+        bridge_name=""
+        tool_name=""
+        bridge_flag=""
+        attache_flag=""
+	conf_dir=""
+	bridge_type_name=""
+
+        if [[ $bridge_type == "lb" ]]; then
+                bridge_id=$linux_bridge_index
+                ((linux_bridge_index++))
+#                bridge_name="$linux_bridge_name$bridge_id"
+		bridge_type_name="Linux Bridge"
+        else
+                bridge_id=$open_vswitch_index
+                ((open_vswitch_index++))
+#                bridge_name="$open_vswitch_name$bridge_id"
+		bridge_type_name="Open vSwitch"
+        fi
+
+	bridge_name="$bridge_name_without_id$bridge_id"
+
+        if [[ $bridge_id == "" ]]; then
+                echo "Failed to insert bridge id."
+                exit
+        fi
+	
+	if [[ $bridge_type == "lb" ]]; then 
+	#	if (grep "7." /etc/redhat-release > /dev/null 2>&1); then
+#	       	output=`systemctl | grep NetworkManager`
+		network_manager_status
+	 	if [[ $? == 0 ]]; then
+	               	create_delete_using_nmcli "$interfaces" "$bridge_name" "$ip" "$bridge_type" 0
+		else
+			split_ip_mask $ip 
+
+			if [[ $rhel_flag == 0 ]]; then 
+	                        conf_dir="/etc/sysconfig/network-scripts/"
+				conf_file="$conf_dir""ifcfg-$bridge_name"
+				
+				if [[ -e $conf_file ]]; then 
+					output=`mv $conf_file "$conf_file""-back"`
+				fi
+				
+				echo "DEVICE=$bridge_name" > $conf_file
+	                        echo "TYPE=Bridge" >> $conf_file
+	                        echo "ONBOOT=yes" >> $conf_file
+	                        echo "IPADDR=$ipv4_only" >> $conf_file
+				echo "NETMASK=$netmask" >> $conf_file
+	                        echo "BOOTPROTO=none" >> $conf_file
+	                        echo "USERCTL=no" >> $conf_file
+		
+				output=`ifup $bridge_name`
+				if [[ $? != 0 ]]; then
+					echo "Failed! to bring up bridge $bridge_name"
+					continue
+				fi
+		
+				for interface in $interfaces; do
+					conf_file="$conf_dir""ifcfg-$interface"
+	
+					if [[ -e $conf_file ]]; then
+		                                output=`mv $conf_file "$conf_file""-back"`
+					fi
+	
+					echo "DEVICE=$interface" > $conf_file
+					echo "ONBOOT=yes" >> $conf_file
+					echo "BRIDGE=$bridge_name" >> $conf_file
+	                        done
+	
+				output=`ifdown $interface`
+				output=`ifup $interface`
+				if [[ $? != 0 ]]; then
+					echo "Failed! to attached interface $interface to bridge $bridge_name"
+					exit 
+				fi
+	
+			elif [[ $sles_flag == 0 ]]; then 
+	                        conf_dir="/etc/sysconfig/network/"
+	                        conf_file="$conf_dir""ifcfg-$bridge_name"
+	
+				echo "NAME='$bridge_name'" > $conf_file
+				echo "TYPE='Bridge'" >> $conf_file
+				echo "ONBOOT='yes'" >> $conf_file
+				echo "IPADDR='$ipv4_only'" >> $conf_file
+				echo "NETMASK='$netmask'" >> $conf_file
+				echo "USERCTL='no'" >> $conf_file
+				echo "STARTMODE='auto'" >> $conf_file
+				echo "BOOTPROTO='static'" >> $conf_file
+				echo "BRIDGE='yes'" >> $conf_file
+				echo "BRIDGE_PORTS='$interfaces'" >> $conf_file
+				
+				output=`ifup $bridge_name`
+	                        if [[ $? != 0 ]]; then
+	                                echo "Failed! to bring up bridge $bridge_name"
+					exit
+	                        fi
+			elif [[ $ubuntu_flag == 0 ]]; then  
+	                        conf_dir="/etc/network/interfaces"
+
+				echo "" >> $conf_dir	
+				echo "auto $bridge_name" >> $conf_dir
+				echo "iface $bridge_name inet static" >> $conf_dir
+				echo "        bridge_ports $interfaces" >> $conf_dir
+				echo "        address $ip" >> $conf_dir
+				echo "        bridge_stp off" >> $conf_dir
+                                echo "" >> $conf_dir
+
+			
+				output=`ifup $bridge_name`
+	                        if [[ $? != 0 ]]; then
+	                                echo "Failed! to bring up bridge $bridge_name"
+	                                exit
+	                        fi
+			else 
+				echo "Not Supported This OS"
+				exit 
+			fi
+			
+			print_msg "$bridge_type_name" "$bridge_name" "$interfaces" "$ip"
+		fi
+	else 
+		echo "Not Supported Static Configure Open vSwitch"
+		exit 
+	fi
+}
+
+##
+# network manager status
+# in <
+# out > 0 - pass, 1 -failed
+##
+function network_manager_status(){
+        if (grep "7\." /etc/redhat-release > /dev/null 2>&1) && [[ $systemctl_flag == 0 ]]; then
+                output=`systemctl | grep NetworkManager`
+                if [[ $? == 0 ]]; then
+                        return 0
+                fi
+        fi
+
+        return 1
+}
+
+##
+# split ip & netmask
+# in <
+# out > 
+##
+function split_ip_mask(){
+	ipv=$1
+
+	ipv4_only=`echo $ipv | awk -F '/' '{print$1}'`
+	mask_length=`echo $ipv | awk -F '/' '{print$2}'`
+	netmask=""
+	case $mask_length in 
+		16)
+			netmask="255.255.0.0"
+		;;
+		24)
+			netmask="255.255.255.0"
+		;;
+		*)
+			netmask="255.0.0.0"
+		;;
+	esac
+}
+
+##
+# create_delete_using_nmcli
+# in < 	1- interfaces
+#	2- bridge_name
+#	3- ipv4
+#	4- bridge_type
+#	5- delete_flag
+# out 
+##
+function create_delete_using_nmcli(){
+        interfaces=$1
+	bridge_name=$2
+	ipv4=$3
+	bridge_type=$4
+	delete_flag=$5
+
+	if [[ $bridge_type == "lb" ]]; then
+		bridge_type_name="Linux Bridge"
+	else 
+		bridge_type_name="Open vSwitch"
+	fi
+
+	if [[ $delete_flag == 1 ]]; then 
+		output=`nmcli connection delete $bridge_name`
+		rc=$?
+		msg="Failed! to delete bridge $bridge_name using nmcli"
+	else
+	        output=`nmcli connection add type bridge ifname $bridge_name con-name $bridge_name ip4 $ipv4`
+		rc=$?
+		msg="Failed! to create bridge $bridge_name using nmcli"	
+	fi
+	if [[ $rc != 0 ]]; then 
+		echo "$msg"
+		continue
+	fi
+	
+	for interface in $interfaces; do
+		if [[ $delete_flag == 1 ]]; then
+		        output=`nmcli connection delete $interface`
+			rc=$?
+			msg="Failed! to de-attached interface $interace to bridge $bridge_name using nmcli"
+		else
+			output=`nmcli connection add type bridge-slave ifname $interface con-name $interface master $bridge_name`
+			rc=$?
+			msg="Failed! to attached interface $interace to bridge $bridge_name using nmcli"
+		fi
+		if [[ $rc != 0 ]]; then
+        	        echo "$msg"
+	        fi
+	done
+
+	output=`nmcli connection reload`
+	if [[ $? != 0 ]]; then
+		echo "Failed! to reload configuration"
+		continue
+	fi
+
+	if [[ $delete_flag == 1 ]]; then
+		echo "Delete $bridge_type_name [$bridge_name] with de-Attached Interface [$interfaces]"
+	else
+		print_msg "$bridge_type_name" "$bridge_name" "$interfaces" "$ip"
+	fi
+}
+
+## 
+# get_ipv4 
+# in < ""
+#	optional ipv4
+# out > ip4
+##
+function get_ipv4(){
+	ipv4=$1 
+	mask_len=$2 
+
+	if [[ $ipv4 == "" ]]; then
+		ipv4=$prefix_bcast_ipv4
+	fi
+
+        cut_count=2
+
+	if [[ $mask_len -le 15 ]]; then
+                cut_count=1
+        elif [[ $mask_len -le 23 ]]; then
+                cut_count=2
+        elif [[ $mask_len -le 31 ]]; then
+                cut_count=3
+        elif [[ $mask_len -gt 32 ]]; then
+                echo "Uncorrect netmask -$mask_len-"
+                exit
+        fi
+
+#        ipv4=`echo $ipv4 | cut -d. -f1-2`	
+	ipv4=`echo $ipv4 | cut -d. -f1-$cut_count`
+
+	post=`hostname -i`
+        if [[ $post == "127.0.1.1" ]] || [[ $post == "127.0.0.1" ]]; then
+                post=`ifconfig | grep 'r:10.' | awk '{ print $2}'`
+        fi
+
+	((cut_count++))
+	post=`echo $post | cut -d. -f$cut_count-4`
+
+        ipv4=$ipv4"."$post
+	ip=$ipv4
+
+	OIFS=$IFS
+        IFS='.'
+        ip=($ip)
+        IFS=$OIFS
+		
+	new_ip=""
+	for ((j=0;j<2;j++)); do
+		y=${ip[$j]}
+		((y++))
+		if [[ $j != 3 ]]; then 
+			new_ip="$new_ip$y."
+		else 
+			new_ip="$new_ip$y"
+		fi
+	done
+
+	new_ip="$new_ip$post"
+
+	prefix_bcast_ipv4=$new_ip
+}
+
+##
+# check if ipv4 addr exist 
+# in < ""
+#       optional ipv4
+# out > 0/1
+##
+function if_ip4_exist(){
+        new_ip=$1
+
+        all_ip_addrs=`ip addr show  | grep "inet " | awk '{print $2}' | cut -d/ -f1`
+        for exist_ip in $all_ip_addrs; do
+                if [[ "$new_ip" == "$exist_ip" ]]; then
+                        return 1
+                fi
+        done
+
+        return 0
+}
+
+##
+# get_ipv4_address
+# in < ""
+#       optional ipv4
+# out > ip4
+##
+function get_ip4_address (){
+        ip4=$1
+	mask_len=$2
+
+        rc=1
+        while [[ $rc != 0 ]]; do
+                get_ipv4 $ip4 $mask_len
+                if_ip4_exist $ipv4
+                rc=$?
+        done
+}
+
+##
+# Create Dynamic Configure
+# in <  1- interfaces
+#       2- bridge type (ovs/lb)
+#       3- ipv4/mask length
+# 	4- bridge over interfaces (1 == yes)
+# 	5- bridge id 
+# out >
+##
+function create_dynamic_bridge (){
+	interfaces=$1
+	bridge_type=$2
+	ip=$3
+	bridge_over_interfaces=$4
+	bridge_id=$5
+	bridge_name=""
+        tool_name=""
+        bridge_flag=""
+        attache_flag=""
+	bridge_type_name=""
+
+	if [ $bridge_type == "lb" ]; then
+		bridge_id=$linux_bridge_index
+		((linux_bridge_index++))
+
+		tool_name="brctl"
+                bridge_flag="addbr"
+                attache_flag="addif"
+#                bridge_name="$linux_bridge_name$bridge_id"
+		bridge_type_name="Linux Bridge"
+	else
+		bridge_id=$open_vswitch_index
+		((open_vswitch_index++))
+
+		tool_name="ovs-vsctl"
+                bridge_flag="add-br"
+                attache_flag="add-port"
+#                bridge_name="$open_vswitch_name$bridge_id"
+		bridge_type_name="Open vSwtich"
+	fi
+
+	bridge_name="$bridge_name_without_id$bridge_id"
+
+	if [[ $bridge_id == "" ]]; then 
+		echo "Failed to insert bridge id."
+		exit
+	fi
+
+        output=`$tool_name $bridge_flag $bridge_name`
+        if [[ $? != 0 ]]; then
+	        echo "Failed to create birdge $bridge_name"
+                exit
+        fi
+
+	for interface in $interfaces; do 
+                output=`ifconfig $interface 0`
+                output=`$tool_name $attache_flag $bridge_name $interface`
+                if [[ $? != 0 ]]; then
+                        echo "Failed to attached interface $interface to bridge $bridge_name"
+                        exit
+                fi
+	done
+	
+	output=`ifconfig $bridge_name $ip up`
+	if [ $? != 0 ]; then 
+		echo "Failed to configure ipv4 bridge name - $bridge_name"
+		exit
+	fi
+
+	print_msg "$bridge_type_name" "$bridge_name" "$interfaces" "$ip"
+}
+
+##
+# validate_install_tool
+# in <  1- bridge type (ovs/lb)
+# out >
+##
+function validate_install_tool(){
+	bridge_type=$1
+	tool_name="brctl"
+	if [ $bridge_type == "ovs" ]; then
+		tool_name="ovs-vsctl"
+	fi
+
+	output=`which $tool_name 2> /dev/null`
+	if [ $? != 0 ]; then
+		echo "FAILED! $tool_name tool not installed"
+		exit
+	fi
+}
+
+##
+# validate_ip
+# in <  1- IPv4 Address
+# out >
+##
+function validate_ip (){
+	ip=$1
+	prefix_ipv4=""
+	this_mask_length=0
+	count_ipv4=0
+	if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        	OIFS=$IFS
+	        IFS='.'
+	        ip=($ip)
+	        IFS=$OIFS
+	        [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 \
+	            && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
+
+		value=$?
+		if [ $? != 0 ]; then 
+			echo "ERROR! Wrong IP4 ... 1"
+			return 1
+		fi
+		
+		prefix_ipv4="${ip[0]}."
+		this_mask_length=8
+		for ((j=1;j<4;j++)); do
+			x=${ip[$j]}
+			if [[ $x < 255 ]]; then 
+				prefix_ipv4="$prefix_ipv4$x."
+				((this_mask_length+=8))
+				((count_ipv4++))
+			else	
+				x=1
+				prefix_ipv4="$prefix_ipv4$x."
+			fi
+	        done
+
+		return 0
+	fi
+
+	echo "ERROR! Wrong IP4 ... 2"	
+	return 1
+}
+
+##
+# Validate interfaces
+# in <  1- interface 
+#       2- validate interface 
+# out
+function validate_interfaces(){
+	interfaces=$1
+	valid_interfaces=$2
+
+	for interface in $interfaces; do 
+		valid_flag=0
+		for valid_interface in $valid_interfaces; do 
+			if [[ "$interface" == "$valid_interface" ]]; then
+				valid_flag=1
+			fi 
+		done
+		if [ $valid_flag == 0 ]; then 
+			echo "ERROR: Unvalid Interfaces"
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+##
+# Delete Dynamic Configure
+# in <  1- i
+#       2- bridge
+# out 
+function delete_bridge (){
+        interfaces=$1
+        bridge_type=$2
+	rc_ovs=0
+	rc_lb=0
+	get_linux_bridges 
+
+	open_vswitch=$ovs_bridges
+	linux_bridges=$lb_bridges
+
+	if [[ $open_vswitch != "" ]]; then
+		rc_ovs=1
+	fi
+        if [[ $linux_bridges != "" ]]; then
+                rc_lb=1
+        fi
+
+	if [[ $bridge_type == "lb" ]] && [[ $rc_lb == 1 ]]; then 
+		delete_bridges_and_deattach_interfaces "$interfaces" "$linux_bridges" "$bridge_type"
+	elif [[ $bridge_type == "ovs" ]] && [[ $rc_ovs == 1 ]]; then
+		delete_bridges_and_deattach_interfaces "$interfaces" "$open_vswitch" "$bridge_type"
+	else
+		if [[ $rc_lb == 1 ]]; then 
+	                delete_bridges_and_deattach_interfaces "$interfaces" "$linux_bridges" "lb"
+		elif [[ $rc_ovs == 1 ]]; then
+	                delete_bridges_and_deattach_interfaces "$interfaces" "$open_vswitch" "ovs"		
+		fi
+	fi
+}
+
+##
+# Delete Bridge and Deattached Interfaces 
+# in <  1- interface 
+#       2- bridgs (names)
+#	3- bridge type 
+# out
+function delete_bridges_and_deattach_interfaces(){
+	interfaces="$1"
+	bridges="$2"
+	bridge_type="$3"
+	bridge_type_name=""
+
+	if [ $bridge_type == "lb" ]; then
+                tool_name="brctl"
+                bridge_flag="delbr"
+                deattache_flag="delif"
+		bridge_type_name="Linux Bridge"
+        else
+                tool_name="ovs-vsctl"
+                bridge_flag="del-br"
+                deattache_flag="del-port"
+		bridge_type_name="Open vSwitch"
+        fi
+
+        for bridge in $bridges; do
+                flag=0
+		error_flag=0
+                attached_interfaces=""
+		attached_mlnx_interfaces=""
+		attached_my_veth_interfaces=""
+		attached_my_vxlan_interfaces=""
+		my_interfaces=""
+
+		get_attached_linux_bridges "$bridge" "$bridge_type"
+		attached_interfaces="$attached_all_interfaces"
+		attached_mlnx_interfaces="$attached_mellanox_interfaces"
+		attached_my_veth_interfaces="$attached_veth_interfaces"
+		attached_my_vxlan_interfaces="$attached_vxlan_interfaces"
+
+		attached_interfaces=`echo $attached_interfaces | tr ' ' '\n'`
+
+		remove_mlnx_interfaces_flag=0
+		remove_vxlan_veth_interfaces_flag=0
+		remove_interfaces_using_ip_link=""
+                if [[ $attached_interfaces != "" ]]; then
+	                for attache_interface in $attached_interfaces; do
+	                        for interface in $interfaces; do
+	                                if [[ $interface =~ $attache_interface$ ]]; then #  == $interface ]]; then 
+						remove_mlnx_interfaces_flag=1
+					elif [[ $attache_interface =~ vxlan* ]] || [[ $attache_interface =~ veth* ]]; then
+						remove_vxlan_veth_interfaces_flag=1
+	                                fi
+	                        done
+	                done
+
+			if [[ $remove_mlnx_interfaces_flag == 1 ]] || [[ $remove_vxlan_veth_interfaces_flag == 1 ]]; then 
+				for attache_interface in $attached_mlnx_interfaces $attached_my_veth_interfaces $attached_my_vxlan_interfaces; do
+
+					output=`$tool_name $deattache_flag $bridge $attache_interface`
+					if [[ $? != 0 ]]; then
+	                                	echo "Failed to de-Attached interface - $attache_interface, bridge $bridge"
+					else 
+						flag=1
+						my_interfaces="$attache_interface $my_interfaces"
+					fi
+	
+					remove_conf_file "$attache_interface"
+				done
+			fi
+
+			if [[ $remove_vxlan_veth_interfaces_flag == 1 ]]; then
+				for ifs_i in $attached_my_veth_interfaces $attached_my_vxlan_interfaces; do 
+					output=`ip link del $ifs_i  > /dev/null 2>&1`
+#					if [[ $? != 0 ]]; then 
+#						echo "Failed to Delete virtual interface $ifs_i"
+#					fi
+				done
+			fi
+	
+			if [[ $flag == 1 ]]; then 
+
+				output=`ifconfig $bridge 0 down`
+		                if [ $? != 0 ]; then
+		                        echo "Failed to delete bridge configuration - $bridge"
+					continue
+		                fi
+		
+		                output=`$tool_name $bridge_flag $bridge`
+				if [[ $? !=  0 ]]; then
+		                        echo "Delete Bridge [$bridge] - FAILED"
+		                fi
+				remove_conf_file "$bridge"
+	
+		                echo "Delete $bridge_type_name [$bridge] with de-Attached Interface [$my_interfaces]"
+			fi
+		fi
+	done
+}
+
+## 
+# Remove Configuration File 
+# in < 1. Interface 
+# out > 
+function remove_conf_file() {
+	interface=$1
+
+        conf_dir=""
+        if [[ $rhel_flag == 0 ]]; then
+                conf_dir="/etc/sysconfig/network-scripts/"
+		rm -rf "$conf_dir""ifcfg-$interface"
+        elif [[ $sles_flag == 0 ]]; then
+                conf_dir="/etc/sysconfig/network/"
+		rm -rf "$conf_dir""ifcfg-$interface"
+        elif [[ $ubuntu_flag == 0 ]]; then
+                conf_file="/etc/network/interfaces"
+		remove_conf_ubuntu $interface $conf_file
+        else
+                echo "Not Supported This OS."
+                exit 1
+        fi
+
+	
+}
+
+## 
+# Remove Static Configuration (Only Ubuntu & Debian)
+# in <  1- interface
+#       2- configuration file location 
+# out 
+function remove_conf_ubuntu(){
+        interface=$1
+        conf_file=$2
+
+        startRemove=`grep $interface $conf_file -n | cut -d: -f1 | head -1`
+        index=$startRemove
+        i=0
+        if [[ $index != "" ]]; then
+	        len=`expr $(grep '' $conf_file -n | tail -q -n 1 | cut -d: -f1) - 1`
+                while read line; do
+	                if [[ $startRemove -le $i ]]; then
+	        	        if [[ $line == *auto* ]]; then
+	                	        sed -i "$startRemove,$index d" $conf_file
+	                                return
+	                        elif [[ $index == $len ]]; then
+	                        	((index++))
+	                                sed -i "$startRemove,$index d" $conf_file
+	                                return
+	                        else
+	 	                       ((index++))
+	                        fi
+			fi
+	                ((i++))
+                done < $conf_file
+	fi
+}
+
+##
+# verfiy_interfaces_bridges
+# in <  1- interface
+# out
+function verfiy_interfaces_bridges(){
+	my_interfaces=$1
+		
+	get_linux_bridges
+	my_ovs_bridges=$ovs_bridges
+	my_lb_bridges=$lb_bridges
+	flags="ovs lb"
+	rename_linux_bridge=""
+	rename_open_vswitch=""
+
+	for flag in $flags; do
+		go_bridges=""
+		my_general_bridge=""
+		tool=""
+		if [[ $flag == "lb" ]] && [[ $lb_flag == 0 ]]; then
+			go_bridges="$my_lb_bridges"
+			tool="brctl"
+                elif [[ $ovs_flag == 0 ]]; then
+			go_bridges="$my_ovs_bridges"
+                        tool="ovs-vsctl"
+		fi
+
+		for i in $go_bridges; do
+			attached_interfaces=""
+		
+			if [[ $i == $bridge_name_without_id* ]]; then 
+				random_bridge_name "brn"
+			fi
+
+			if [[ $i == $vxlan_bridge_name* ]]; then 
+				random_bridge_name "vxm"
+			fi
+
+			if [[ $flag == "lb" ]]; then 
+				output=`brctl showstp $i >& /dev/null`
+				if [[ $? == 0 ]]; then 
+		                        attached_interfaces=`brctl showstp $i | grep ".*(.*)" | awk '{print$1}'`
+					if [[ $i == $linux_bridge_name* ]]; then
+						rename_linux_bridge="lb"
+					fi
+				fi
+			else
+				attached_interfaces=`ovs-vsctl list-ports $i`
+				if [[ $i == $open_vswitch_name* ]]; then
+                                        rename_open_vswitch="ovs"
+                                fi
+			fi
+	
+
+                        for j in $attached_interfaces; do
+                                for l in $my_interfaces; do
+                                        if [[ $l == $j ]]; then
+                                                echo "ERROR: Please check you exist bridges using: '$tool show'"
+                                                exit
+                                        fi
+                                done
+                        done
+                done 
+	done
+
+	random_bridge_name $rename_linux_bridge
+	random_bridge_name $rename_open_vswitch
+}
+
+##
+# random_bridge_name
+# in <  1- interface
+# out
+function random_bridge_name(){
+	bridge_type=$1
+
+	new_bridge_name=`cat /dev/urandom | tr -dc 'a-z' | fold -w 2 | head -1`
+	if [[ $bridge_type == "lb" ]]; then 
+		linux_bridge_name=$new_bridge_name
+	elif [[ $bridge_type == "ovs" ]]; then 
+		open_vswitch_name=$new_bridge_name
+	elif [[ $bridge_type == "brn" ]]; then 
+		bridge_name_without_id=$new_bridge_name
+	elif [[ $bridge_type == "vxm" ]]; then 
+		vxlan_bridge_name=$new_bridge_name
+	fi
+}
+
+##
+# print_msg
+# in <  1- interface
+# out
+function print_msg(){
+	bridge_type_name_virt="$1"
+	bridge_name="$2"
+	interfaces="$3"
+	ip="$4"
+	ipv4=`echo $ip | cut -d '/' -f1`
+
+	echo "Added $bridge_type_name_virt [$bridge_name] with Attached Interface [$interfaces] IPv4 [$ipv4]"
+}
+
+##
+# Static Dynamic, Create Delete
+# in <  1- interfaces
+#       2- bridge type (ovs/lb)
+#       3- prefix broadcast ipv4 (123.15.)
+#       4- mask length (16, 8, 21, ...)
+#       5- length ipv4 (1,2,3)
+#       6- bridge over interfaces (0 == no)
+#       7- delete flag (1 == yes)
+# 	8- which type ([d]ynamic, [s]tatic)
+#	9- extended ([vxlan]|[gre]|[])
+# out >
+##
+function create_delete_static_dynamic_configure(){
+        interfaces="$1"
+        bridge_type=$2
+        ip4=$3
+        mask_length=$4
+        bridge_id=""
+        delete_flag=$7
+	which_type=$8
+	extended=$9
+
+        if [[ $bridge_type == "lb" ]]; then
+                bridge_id=$linux_bridge_index
+        else
+                bridge_id=$open_vswitch_index
+        fi
+
+	function_name=""
+	if [[ $which_type == "d" ]]; then 
+		function_name="create_dynamic_bridge"
+	elif [[ $which_type == "s" ]]; then
+		function_name="create_static_bridge"
+	fi
+
+	if [[ $extended == "" ]]; then 
+	        if [[ $delete_flag == 1 ]]; then
+	                delete_bridge "$interfaces" $bridge_type
+	        else
+	
+	                if [[ $bridge_type == "lb" ]]; then
+	                        bridge_id=$linux_bridge_index
+	                else
+	                        bridge_id=$open_vswitch_index
+	   	        fi
+	                
+			get_ip4_address
+	                ip4=$ipv4
+	                ip4="$ip4/$mask_length"
+
+	                if [[ $6 != 0 ]]; then
+				$function_name "$interfaces" $2 $ip4 $6 $bridge_id
+	                else
+	                        for interface in $interfaces; do
+					$function_name "$interface" $2 $ip4
+	                                get_ip4_address
+	                                ip4="$ipv4/$mask_length"
+	                        done
+	                fi
+	        fi
+	else
+		create_delete_static_dynamic_vxlan_gre_configure "$extended" "$bridge_type" "$which_type" "$delete_flag"
+	fi
+}
+
+# Execute command w/ echo and exit if it fail
+function ex() {
+#    echo "$@"
+    if ! eval "$@"; then
+        printf "\nFailed executing $@\n"
+        exit 1
+    fi
+}
+
+# Static Dynamic, vxlan, gre Create Delete
+# in <  1- virt type [vxlan|gre]
+#       2- bridge type (ovs/lb)
+#       3- which type ([d]ynamic, [s]tatic)
+#       4- delete flag (1 == yes)
+# out >
+##
+function create_delete_static_dynamic_vxlan_gre_configure(){
+	virt_type=$1 
+	bridge_type=$2 
+	which_type=$3 
+	delete_flag=$4
+
+        bridge_name=""
+        tool_name=""
+        bridge_flag=""
+        attache_flag=""
+        bridge_type_name=""
+	this_virt_type=$virt_type
+	this_type_conf=""
+
+#        if [[ $virt_type == "gre" ]]; then
+#                echo "Not Supported - GRE"
+#                exit 5
+#:        fi
+
+        if [[ $which_type == "s" ]]; then
+                echo "Not Supported VxLAN Static Configuration"
+                exit 9
+        fi
+	
+	if [[ $delete_flag == 1 ]]; then 
+		delete_vxlan $bridge_type
+	else
+	        if [[ $bridge_type == "lb" ]]; then
+	                bridge_id=$linux_bridge_index
+	                ((linux_bridge_index++))
+	
+	                tool_name="brctl"
+	                bridge_flag="addbr"
+	                attache_flag="addif"
+	#                bridge_name="$linux_bridge_name$bridge_id"
+	                bridge_type_name="Linux Bridge"
+			this_type_conf="lb"
+	        else
+	                bridge_id=$open_vswitch_index
+	                ((open_vswitch_index++))
+	
+	                tool_name="ovs-vsctl"
+	                bridge_flag="add-br"
+	                attache_flag="add-port"
+	#                bridge_name="$open_vswitch_name$bridge_id"
+	                bridge_type_name="Open vSwtich"
+			this_type_conf="ovs"
+	        fi
+	
+		bridge_name="$bridge_name_without_id$bridge_id"
+	
+		my_virt_ipv4=`echo $virt_ipv4 | cut -d/ -f1`
+		my_mask_length=`echo $virt_ipv4 | cut -d/ -f2`
+	
+		validate_ip $my_virt_ipv4
+		if [[ $? != 0 ]]; then 
+			exit
+		fi
+
+		if (( "$my_mask_length" >= "31" )); then 
+			echo "Netmask Length not Valid."
+			exit
+		fi
+
+		get_ip4_address "$my_virt_ipv4" "$my_mask_length"
+#		this_virt_ipv4="$ipv4/$my_mask_length"
+		this_virt_ipv4=$virt_ipv4
+		this_ipv4=$ipv4
+
+		veth_interfaces=`ls /sys/class/net/ | grep veth`
+                j=0
+        	for i in $veth_interfaces; do
+	                ((j++))
+                done	
+		veth_config_count=$j
+	        veth_attach_count=`expr $veth_config_count + 1`
+
+		index=0
+		num_vxlans=`expr $key_id + $num_vxlans`
+		for ((i=$key_id;i<$num_vxlans;i++)); do
+			my_vxlan_bridge_name="$vxlan_bridge_name$i"
+		        veth_config="veth$veth_config_count"
+	                veth_attach="veth$veth_attach_count"
+			my_virt_name="$virt_name-$this_type_conf$index"
+	
+	                ex "$tool_name $bridge_flag $my_vxlan_bridge_name"
+	
+			if [[ $bridge_type == "ovs" ]]; then
+				ex "$tool_name $attache_flag $my_vxlan_bridge_name $my_virt_name -- set interface $my_virt_name type=$virt_type options:remote_ip=$remote_ipv4 options:key=$i options:dst_port=$port_n"
+			elif [[ $bridge_type == "lb" ]]; then
+				in_dst_port=""
+				
+				output=`ip link add mnb type vxlan help 4&> /tmp/mnb.log`
+				output=`cat /tmp/mnb.log | grep dstport`
+				dstport_rc=$?
+
+				if [[ $virt_type == vxlan ]]; then
+					if [[ $dstport_rc == 0 ]]; then 
+						in_dst_port="dstport $port_n"
+					fi
+				fi 
+	
+		                ex "ip link add $my_virt_name type $virt_type id $i group 224.10.10.10 ttl 10 $in_dst_port dev $specific_interface"
+				output=`ip link show vxlan-lb0 > /dev/null 2>&1`
+				if [[ $? == 0 ]]; then 
+			                ex "ip link set $my_virt_name up"
+				fi
+		                ex "$tool_name $attache_flag $my_vxlan_bridge_name $my_virt_name"
+	
+			else 
+				exit 
+			fi
+	
+			ex "ip link add type veth"
+	                ex "ifconfig $veth_config $this_virt_ipv4 mtu 1450 up"
+	                ex "ifconfig $veth_attach mtu 1450 up"
+	                ex "$tool_name $attache_flag $my_vxlan_bridge_name $veth_attach"
+		        ex "ifconfig $my_vxlan_bridge_name up"
+
+			this_ipv4=$this_virt_ipv4
+
+			get_ip4_address
+		        this_virt_ipv4="$ipv4/16"
+			veth_config_count=`expr $veth_config_count + 2`
+	                veth_attach_count=`expr $veth_attach_count + 2`
+			((index++))
+
+		        print_msg "$this_virt_type $bridge_type_name" "$my_vxlan_bridge_name" "$my_virt_name & $veth_attach, Virtual Config Interface $veth_config" "$this_ipv4"
+		done
+	fi
+}
+
+function delete_vxlan (){
+	bridge_type=$1
+        
+        get_linux_bridges
+        open_vswitch=$ovs_bridges
+        linux_bridges=$lb_bridges
+
+	if [[ $bridge_type == "ovs" ]]; then
+		open_vswitch=`echo $open_vswitch | tr ' ' '\n'`
+		remove_bridge "$open_vswitch" "ovs"
+	else 
+		linux_bridges=`echo $linux_bridges | tr ' ' '\n'`
+		remove_bridge "$linux_bridges" "lb"
+	fi
+
+}
+
+function remove_bridge() {
+	bridge_name=$1
+	which_type=$2
+
+	for i in $bridge_name; do
+                flag=0
+		attached_interfaces=""
+		remove_veth_interface=""
+		if [[ $which_type == "ovs" ]]; then 
+	                attached_interfaces=`ovs-vsctl list-ports $i`
+		else 
+			get_attached_linux_bridges "$i" 
+			attached_interfaces=$attached_all_interfaces
+		fi
+
+		if [[ $attached_interfaces != "" ]]; then 	
+			delete_bridges_and_deattach_interfaces "$attached_interfaces" "$i" "$which_type"
+
+			for j in $attached_interfaces; do
+				if [[ $attache_interface =~ vxlan* ]] || [[ $attache_interface =~ veth* ]]; then
+					ip link del $j
+				fi
+			done 
+
+			if [[ $which_type == "lb" ]]; then
+				for j in $attached_vxlan_interfaces; do
+					ip link del $j
+				done 
+			fi
+		fi
+        done
+}
+
+function show(){
+
+	get_mlnx_interfaces
+	interfaces="$mlx4_interfaces $mlx5_interfaces $eipoib_interfaces $ipoib_interfaces"
+	
+	get_linux_bridges "br0"
+	
+	open_vswitch=$ovs_bridges
+	linux_bridges=$lb_bridges
+
+	if [[ $open_vswitch != "" ]]; then
+                showshow "$open_vswitch" "ovs"
+	else
+                echo "no Open vSwtich"
+        fi
+
+        if [[ $linux_bridges == "" ]] || [[ $linux_bridges =~ "br" ]]; then
+                echo "no Linux Bridge"
+	else
+                showshow "$linux_bridges" "lb"
+        fi
+}
+
+function showshow(){
+	bridges=$1
+	bridge_type=$2
+
+        for bridge in $bridges; do
+                flag=0
+                attached_interfaces=""
+                attached_mlnx_interfaces=""
+                attached_my_veth_interfaces=""
+                attached_my_vxlan_interfaces=""
+                my_interfaces=""
+
+                get_attached_linux_bridges "$bridge" "$bridge_type"
+                attached_interfaces="$attached_all_interfaces"
+                attached_mlnx_interfaces="$attached_mellanox_interfaces"
+                attached_my_veth_interfaces="$attached_veth_interfaces"
+                attached_my_vxlan_interfaces="$attached_vxlan_interfaces"
+
+                attached_interfaces=`echo $attached_interfaces | tr ' ' '\n'`
+
+                interfaces_flag=0
+		this_interfaces_attached=""
+		
+		if [[ $attached_interfaces == "" ]]; then 
+			continue
+		else
+			for attache_interface in $attached_interfaces; do
+                        	for interface in $interfaces; do
+                                        if [[ $interface =~ $attache_interface$ ]]; then 
+                                                interfaces_flag=1
+						this_interfaces_attached="$this_interfaces_attached $interface"
+                                        elif [[ $attache_interface =~ vxlan* ]] || [[ $attache_interface =~ veth* ]]; then
+                                                interfaces_flag=1
+						this_interfaces_attached="$this_interfaces_attached $interface"
+                                        fi
+                                done
+                        done
+
+			type_type="Open vSwtich"
+			if [[ $bridge_type == "lb" ]]; then 
+				type_type="Linux Bridge"
+			fi
+
+                        if [[ $interfaces_flag == 1 ]]; then
+				this_interfaces_attached=`echo $this_interfaces_attached | tr ' ' '\n'`
+				bridge=`echo $bridge  | tr ' ' '\n'`
+				echo "$type_type [$bridge] attached [$this_interfaces_attached]"
+                        fi
+                fi
+	done
+}
+
+##
+# main
+##
+
+output=`which ovs-vsctl > /dev/null 2>&1`
+ovs_flag=$?
+output=`which brctl > /dev/null 2>&1`
+lb_flag=$?
+
+# conf param
+args=("$@")
+len=${#args[@]}
+
+linux_bridge_name="lb"
+open_vswitch_name="ovs"
+linux_bridge_index=1
+open_vswitch_index=1
+
+bridge_name_without_id=""
+
+open_vswitch=0
+linux_bridge=0
+all_bridge=0
+fail=0
+count_bridge=0
+
+dynamic=0
+static=0
+remove=0
+count_setting=0
+
+count_mask_length=0
+mask_length=16
+
+count_broadcast=0
+prefix_bcast_ipv4="123.15.1.1"
+length_ipv4=2
+
+more_than_interfaces=0
+bridge_over_interfaces=0
+interface_only=0
+mlnx_name_flag=0
+specific_interface=""
+device_type=""
+vxlan_flag=0
+
+tool_name=`basename $0`
+extend_interfaces=""
+remote_ipv4=""
+virt_ipv4=""
+virt_type="vxlan"
+vxlan_bridge_name="mb"
+virt_name="vxlan"
+key_id=5
+tool_version="version 1.0 "
+port_n=4789
+num_vxlans=1
+extend_flag=0
+index_arr=0
+
+output=`which zypper > /dev/null 2>&1`
+sles_flag=$?
+output=`which yum > /dev/null 2>&1`
+rhel_flag=$?
+output=`which apt-get > /dev/null 2>&1`
+ubuntu_flag=$?
+output=`which systemctl > /dev/null 2>&1`
+systemctl_flag=$?
+
+if [[ ${args[${index_arr}]} == "-v" ]] || [[ ${args[${index_arr}]} == "--version" ]]; then
+                version
+		exit 231
+fi
+
+if [[ ${args[${index_arr}]} == "show" ]]; then 
+	((index_arr++))
+	if [[ ${args[${index_arr}]} == "" ]]; then 
+		show
+		exit 1
+	else 
+		usage 
+	fi
+fi 
+
+if [ `expr $# % 2` == 1 ]; then usage; fi
+
+modinfo eth_ipoib >& /dev/null 
+
+if [[ $? == 0 ]]; then
+	modprobe eth_ipoib
+	sleep 3
+fi
+
+get_mlnx_interfaces
+interfaces="$mlx4_interfaces $mlx5_interfaces $eipoib_interfaces"
+
+for ((i=0;i<$len;i++)); do
+        arg=${args[${i}]}
+	if [ $arg == "-v" ] || [ $arg == "--version" ]; then 
+		version
+		exit 455
+        elif [ $arg == "--mode" ] || [ $arg == "-m" ]; then
+                ((i++))
+                arg=${args[${i}]}
+                if [ $arg == "ovs" ]; then 
+			validate_install_tool "ovs"
+			open_vswitch=1
+                elif [ $arg == "lb" ]; then 
+			validate_install_tool "lb"
+			linux_bridge=20
+		elif [ $arg == "all" ]; then 
+			all_bridge=3000
+                else 
+			fail=7021
+                fi
+                ((count_bridge++))
+        elif [ $arg == "--setting" ] || [ $arg == "-s" ]; then
+                ((i++))
+                arg=${args[${i}]}
+
+                if [ $arg == "d" ]; then 
+			dynamic=400
+                elif [ $arg == "s" ]; then 
+			static=500
+                elif [ $arg == "r" ]; then 
+			remove=600
+                else 
+			fail=8500
+                fi
+                ((count_setting++))
+	elif [ $arg == "--type" ] || [ $arg == "-t" ]; then
+                ((i++))
+                arg=${args[${i}]}
+
+                if [ $arg == "eth" ]; then 
+			interfaces="$mlx4_interfaces $mlx5_interfaces"
+                elif [ $arg == "ib" ]; then 
+			interfaces="$eipoib_interfaces"
+                elif [ $arg == "all" ]; then 
+			interfaces="$mlx4_interfaces $mlx5_interfaces $eipoib_interfaces"
+                else 
+			fail=8500
+                fi
+	elif [ $arg == "--bridge" ] || [ $arg == "-b" ]; then 
+		((i++))
+                arg=${args[${i}]}
+		bridge_name_without_id=$arg
+	elif [ $arg == "--extend" ] || [ $arg == "-e" ]; then
+		extend_flag=980
+		((i++))
+		virt_type=${args[${i}]}
+		((i++))
+		j=0
+		for ((;i<$len;i++)); do
+	                arg=${args[${i}]}
+
+			if [[ $arg == "interface" ]]; then 
+				((i++))
+				specific_interface=${args[${i}]}
+			elif [[ $arg == "remote" ]]; then
+				((i++))
+				remote_ipv4=${args[${i}]}
+			elif [[ $arg == "virt_ip" ]]; then 
+				((i++))
+				virt_ipv4=${args[${i}]}
+			elif [[ $arg == "virt_name" ]]; then 
+				((i++))
+				virt_name="vxlan"${args[${i}]}
+			elif [[ $arg == "key" ]]; then 
+				((i++))
+				key_id=${args[${i}]}
+			elif [[ $arg == "port" ]]; then 
+				((i++))
+				port_n=${args[${i}]}
+			elif [[ $arg == "bridge_name" ]]; then 
+				((i++))
+				vxlan_bridge_name=${args[${i}]}
+			elif [[ $arg == "num_vxlans" ]]; then 
+				((i++))
+				num_vxlans=${args[${i}]}
+			else 
+				j=$i
+				i=$len	
+				((i++))
+	                fi
+		done
+		if [[ $j == 0 ]]; then 
+			i=$len
+		else 
+			((j--))
+			i=$j
+		fi
+	elif [ $arg == "--mlx_name" ] || [ $arg == "-l" ]; then 
+		((i++))
+		device_type=${args[${i}]}
+		mlnx_name_flag=55955
+                if [ $device_type == "mlx4" ]; then 
+			interfaces="$mlx4_interfaces $eipoib_interfaces"
+		elif [ $device_type == "mlx5" ]; then 
+			interfaces="$mlx5_interfaces $eipoib_interfaces"
+		else 
+			fail=2341
+		fi
+		
+	elif [ $arg == "--broadcast" ] || [ $arg == "-b" ]; then 
+		((i++))
+                arg=${args[${i}]}
+		validate_ip "$arg"
+		if [[ $? == 0 ]]; then 
+			prefix_bcast_ipv4=$prefix_ipv4
+			mask_length=$this_mask_length
+			length_ipv4=$count_ipv4
+		else 
+			exit
+		fi
+		((count_broadcast++))
+	elif [ $arg == "--mask_length" ] || [ $arg == "-k" ]; then 
+		((i++))
+                arg=${args[${i}]}
+		if [ $arg -le  31 ]; then 
+			mask_length=$arg
+		else 
+			fail=7000
+		fi
+		((count_mask_length++))
+	elif [ $arg == "--interface" ] || [ $arg == "-i" ]; then 
+		((i++))
+		arg=${args[${i}]}
+		validate_interfaces "$arg" "$interfaces"
+                if [ $? != 0 ]; then
+                	exit
+                fi
+		specific_interface="$arg"
+		interface_only=81654
+	elif [ $arg == "-o" ] || [ $arg == "--bridge_over_interfaces" ]; then 
+		((i++))
+                arg=${args[${i}]}
+		if [[ $arg != 0 ]]; then 
+			validate_interfaces "$arg" "$interfaces"
+			if [ $? != 0 ]; then 
+				exit
+			fi
+			bridge_over_interfaces=139
+			more_than_interfaces="$arg"
+		fi
+	else	
+		echo "usage::arg=${args[${i}]}"
+                usage
+        fi
+
+        if [ $fail != 0 ]; then 
+		echo "FAILED: $fail"
+		usage
+	fi
+done
+
+x=`expr $static + $all_bridge`
+y=`expr $dynamic + $all_bridge`
+if [[ $x -gt 3000 ]] || [[ $y -gt 3000 ]]; then
+	usage
+fi
+
+if [[ $mlnx_name_flag != 0 ]] && [[ $interface_only != 0 ]] || [[ $extend_flag != 0 ]]; then 
+	validate_interfaces "$specific_interface" "$interfaces"
+	if [ $? != 0 ]; then
+		echo "Interface: $interfaces != Type: $device_type"
+		exit 
+	fi
+	interfaces="$specific_interface"
+fi
+
+if [[ $count_bridge != 1 ]] || [[ $count_setting > 1 ]]; then 
+	usage
+fi
+
+if [[ $count_setting == 0 ]]; then 
+	dynamic=400
+fi
+
+get_mlnx_interfaces
+
+to_config=`expr $open_vswitch + $linux_bridge + $all_bridge + $dynamic + $static + $remove + $extend_flag`
+
+if [[ $bridge_name_without_id == "" ]]; then 
+	if [[ $extend_flag != 0 ]]; then
+		if [[ $bridge_name_without_id != "" ]]; then 	
+			vxlan_bridge_name=$bridge_name_without_id
+		fi
+	elif [[ $open_vswitch == 1 ]]; then 
+		bridge_name_without_id=$open_vswitch_name
+	else
+		bridge_name_without_id=$linux_bridge_name
+	fi
+fi
+
+if [[ $remove != "600" ]]; then
+	verfiy_interfaces_bridges $interfaces
+fi
+
+case $to_config in
+        401)
+		create_delete_static_dynamic_configure "$interfaces" "ovs" "$prefix_bcast_ipv4" "$mask_length" $length_ipv4 $bridge_over_interfaces "" "d"
+        ;;
+        501)
+                create_delete_static_dynamic_configure "$interfaces" "ovs" "$prefix_bcast_ipv4" "$mask_length" $length_ipv4 $bridge_over_interfaces "" "s"
+        ;;
+        601)
+		create_delete_static_dynamic_configure "$interfaces" "ovs" "" "" "" $bridge_over_interfaces "1" 
+        ;;
+        420)
+                create_delete_static_dynamic_configure "$interfaces" "lb" "$prefix_bcast_ipv4" "$mask_length" $length_ipv4 $bridge_over_interfaces "" "d"
+        ;;
+        520)
+                create_delete_static_dynamic_configure "$interfaces" "lb" "$prefix_bcast_ipv4" "$mask_length" $length_ipv4 $bridge_over_interfaces "" "s"
+        ;;
+        620)
+                create_delete_static_dynamic_configure "$interfaces" "lb" "" "" "" $bridge_over_interfaces "1" 
+        ;;
+        3600)
+                create_delete_static_dynamic_configure "$interfaces" "ovs" "" "" "" $bridge_over_interfaces "1"
+                create_delete_static_dynamic_configure "$interfaces" "lb" "" "" "" $bridge_over_interfaces "1"
+        ;;
+        1400)
+		create_delete_static_dynamic_configure "" "lb" "" "" "" "" "" "d" "$virt_type"
+        ;;
+        1500)
+                create_delete_static_dynamic_configure "" "lb" "" "" "" "" "" "s" "$virt_type"
+        ;;
+        1600)
+                create_delete_static_dynamic_configure "" "lb" "" "" "" "" "1" "" "$virt_type"
+        ;;
+        1381)
+                create_delete_static_dynamic_configure "" "ovs" "" "" "" "" "" "d" "$virt_type"
+
+        ;;
+        1481)
+                create_delete_static_dynamic_configure "" "ovs" "" "" "" "" "" "s" "$virt_type"
+
+        ;;
+        1581)
+                create_delete_static_dynamic_configure "" "ovs" "" "" "" "" "1" "" "$virt_type"
+        ;;
+        4580)
+                create_delete_static_dynamic_configure "" "ovs" "" "" "" "" "1" "" "$virt_type"
+                create_delete_static_dynamic_configure "" "lb" "" "" "" "" "1" "" "$virt_type"
+        ;;
+        *)
+                echo "$0 Error: Unknown flag"
+                usage
+                exit
+        ;;
+esac
